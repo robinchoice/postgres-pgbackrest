@@ -31,6 +31,8 @@ sql 'CREATE TABLE wal_probe (id integer PRIMARY KEY); INSERT INTO wal_probe VALU
 docker exec --user postgres "$source_container" pgbackrest --stanza=app stanza-create
 docker exec --user postgres "$source_container" pgbackrest --stanza=app check
 docker exec --user postgres "$source_container" pgbackrest --stanza=app --type=full backup
+# pgBackRest selects a backup whose whole-second stop time precedes the target.
+sleep 1
 sql 'INSERT INTO wal_probe VALUES (2)' >/dev/null
 target=$(sql "SELECT clock_timestamp() AT TIME ZONE 'UTC'")
 sleep 1
