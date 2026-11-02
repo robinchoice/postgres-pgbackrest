@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+prefix=wal-local-$$
+image=wal-pilot-local:16-alpine
+source_container=$prefix-source
+restore_container=$prefix-restore
+repo_volume=$prefix-repo
+restore_volume=$prefix-data
+cleanup() {
+    docker rm -f -v "$source_container" "$restore_container" >/dev/null 2>&1 || true
+    docker volume rm "$repo_volume" "$restore_volume" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+docker volume create "$repo_volume" >/dev/null
+docker volume create "$restore_volume" >/dev/null
+docker run --rm --network none -v "$repo_volume:/repo" -v "$restore_volume:/restore" \
+    --entrypoint sh "$image" -c 'chown postgres:postgres /repo /restore' >/dev/null
+docker run -d --name "$source_container" --network none --memory 512m \
+    -v "$repo_volume:/repo" -e POSTGRES_PASSWORD=synthetic-test \
+    -e PGBACKREST_REPO1_PATH=/repo "$image" \
+    postgres -c archive_mode=on -c archive_timeout=60 \
+    -c 'archive_command=pgbackrest --stanza=app archive-push %p' >/dev/null
+for _ in $(seq 60); do
+    if docker exec "$source_container" pg_isready -q -h 127.0.0.1 -U postgres; then break; fi
+    sleep 1
+done
+docker exec "$source_container" postgres --version
+docker exec "$source_container" pgbackrest version
+sql() { docker exec --user postgres "$source_container" psql -XAt -v ON_ERROR_STOP=1 -U postgres -d postgres -c "$1"; }
+sql 'CREATE TABLE wal_probe (id integer PRIMARY KEY); INSERT INTO wal_probe VALUES (1)' >/dev/null
+docker exec --user postgres "$source_container" pgbackrest --stanza=app stanza-create
+docker exec --user postgres "$source_container" pgbackrest --stanza=app check
+docker exec --user postgres "$source_container" pgbackrest --stanza=app --type=full backup
+sql 'INSERT INTO wal_probe VALUES (2)' >/dev/null
+target=$(sql "SELECT clock_timestamp() AT TIME ZONE 'UTC'")
+sleep 1
+sql 'INSERT INTO wal_probe VALUES (3); SELECT pg_switch_wal()' >/dev/null
+docker exec --user postgres "$source_container" pgbackrest --stanza=app check
+docker run --rm --network none --user postgres -v "$repo_volume:/repo:ro" \
+    -v "$restore_volume:/var/lib/postgresql/data" -e PGBACKREST_REPO1_PATH=/repo \
+    --entrypoint pgbackrest "$image" --stanza=app --type=time --target="$target+00" \
+    --target-action=promote --archive-mode=off restore
+docker run -d --name "$restore_container" --network none --memory 512m \
+    -v "$repo_volume:/repo:ro" -v "$restore_volume:/var/lib/postgresql/data" \
+    -e PGBACKREST_REPO1_PATH=/repo "$image" postgres -c archive_mode=off >/dev/null
+for _ in $(seq 60); do
+    if docker exec "$restore_container" pg_isready -q -h 127.0.0.1 -U postgres; then break; fi
+    sleep 1
+done
+restored=$(docker exec --user postgres "$restore_container" psql -XAt -v ON_ERROR_STOP=1 -U postgres -d postgres \
+    -c "SELECT count(*) || ':' || max(id) || ':' || pg_is_in_recovery() FROM wal_probe")
+[[ $restored == '2:2:false' ]] || { echo "PITR failed: $restored" >&2; exit 1; }
+echo "PITR passed: base backup had 1 row, restored 2 rows, later third row excluded; target $target UTC"
